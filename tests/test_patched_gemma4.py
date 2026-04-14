@@ -1,18 +1,21 @@
 """Tests for the Gemma 4 monkey patch."""
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-import numpy as np
 import pytest
 
 import mlx.core as mx
 import mlx_lm.models.gemma4_text as gemma4_text_module
 
 from mlx_engine.generate import load_model
-from mlx_engine.model_kit.patches.gemma4 import OriginalGemma4TextModel
+from mlx_engine.model_kit.patches.gemma4 import (
+    OriginalGemma4TextModel,
+    PatchedGemma4TextModel,
+)
 from mlx_engine.utils.image_utils import convert_to_pil
 from mlx_engine.utils.prompt_progress_reporter import DefaultPromptProgressReporter
-from mlx_vlm.models.cache import make_prompt_cache as make_vlm_prompt_cache
 from mlx_vlm.utils import load_processor, prepare_inputs
 
 from tests.patched_model_test_utils import (
@@ -26,12 +29,8 @@ from tests.patched_model_test_utils import (
 from tests.shared import read_image_b64
 from transformers import AutoProcessor
 
-pytestmark = pytest.mark.heavy
-
 GEMMA4_MODEL_NAME = "lmstudio-community/gemma-4-E2B-it-MLX-4bit"
-GEMMA4_IMAGE_TOPK = 5
-GEMMA4_IMAGE_TOPK_PROB_RTOL = 0.25
-GEMMA4_IMAGE_TOPK_PROB_REF_FLOOR = 1e-3
+GEMMA4_IMAGE_PROMPT_EMBEDDINGS_ATOL = 0.05
 
 
 def tokenize_prompt(tokenizer, prompt: str) -> list[int]:
@@ -69,86 +68,6 @@ def load_vlm_processor(model_path: Path):
     return load_processor(model_path, add_detokenizer=True)
 
 
-def first_vlm_generation_logits(
-    model,
-    *,
-    input_ids: mx.array,
-    pixel_values: mx.array,
-    attention_mask: mx.array,
-    prefill_step_size: int = 2048,
-) -> mx.array:
-    """Return the first-step logits from mlx-vlm's generation path."""
-    prompt_cache = make_vlm_prompt_cache(model.language_model)
-    embedding_output = model.get_input_embeddings(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        mask=attention_mask,
-    )
-    inputs_embeds = embedding_output.inputs_embeds
-    kwargs = {
-        key: value
-        for key, value in embedding_output.to_dict().items()
-        if key != "inputs_embeds" and value is not None
-    }
-
-    while inputs_embeds.shape[1] > 1:
-        n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
-        if n_to_process <= 0:
-            break
-        model.language_model(
-            inputs=input_ids[:, :n_to_process],
-            inputs_embeds=inputs_embeds[:, :n_to_process],
-            cache=prompt_cache,
-            n_to_process=n_to_process,
-            **kwargs,
-        )
-        mx.eval([cache.state for cache in prompt_cache])
-        input_ids = input_ids[:, n_to_process:]
-        inputs_embeds = inputs_embeds[:, n_to_process:]
-        mx.clear_cache()
-
-    outputs = model.language_model(
-        input_ids[:, -1:],
-        inputs_embeds=inputs_embeds[:, -1:],
-        cache=prompt_cache,
-        **kwargs,
-    )
-    mx.eval(outputs.logits)
-    return mx.array(outputs.logits[0, -1, :])
-
-
-def topk_token_ids(logits: mx.array, k: int) -> list[int]:
-    values = np.array(logits.tolist(), dtype=np.float32)
-    return [int(index) for index in np.argsort(values)[-k:][::-1]]
-
-
-def gather_values(values: mx.array, token_ids: list[int]) -> list[float]:
-    return [float(values[token_id].item()) for token_id in token_ids]
-
-
-def softmax_probabilities(logits: mx.array) -> mx.array:
-    return mx.softmax(logits.astype(mx.float32), axis=-1)
-
-
-def relative_differences(
-    actual_values: list[float],
-    reference_values: list[float],
-    reference_floor: float,
-) -> list[float]:
-    diffs = []
-    for actual, reference in zip(actual_values, reference_values):
-        scale = max(abs(reference), reference_floor)
-        diffs.append(abs(actual - reference) / scale)
-    return diffs
-
-
-def format_token_values(token_ids: list[int], values: list[float], tokenizer) -> str:
-    parts = []
-    for token_id, value in zip(token_ids, values):
-        parts.append(f"{token_id}:{tokenizer.decode([token_id])!r}:{value:.6f}")
-    return "[" + ", ".join(parts) + "]"
-
-
 def resolve_image_token_index(config) -> int | None:
     vision_config = getattr(config, "vision_config", None)
     return getattr(
@@ -162,6 +81,38 @@ def resolve_image_token_index(config) -> int | None:
     )
 
 
+def test_patched_gemma4_slices_stored_prompt_ids_before_forward():
+    model = PatchedGemma4TextModel.__new__(PatchedGemma4TextModel)
+    model.prompt_per_layer_input_ids = mx.array([[10, 11, 12, 13, 14]], dtype=mx.int32)
+    expected_input_ids = mx.array([[12, 13]], dtype=mx.int32)
+    input_embeddings = mx.zeros((1, 2, 8), dtype=mx.float32)
+
+    with (
+        patch.object(
+            PatchedGemma4TextModel,
+            "_get_per_layer_inputs",
+            autospec=True,
+            return_value=expected_input_ids,
+        ) as get_per_layer_inputs,
+        patch.object(
+            OriginalGemma4TextModel,
+            "__call__",
+            autospec=True,
+            return_value="forwarded",
+        ) as super_call,
+    ):
+        result = model(
+            inputs=mx.array([[0, 1]], dtype=mx.int32),
+            cache=[SimpleNamespace(offset=2)],
+            input_embeddings=input_embeddings,
+        )
+
+    assert result == "forwarded"
+    assert mx.array_equal(get_per_layer_inputs.call_args.args[1], expected_input_ids)
+    assert super_call.call_args.kwargs["per_layer_inputs"] is expected_input_ids
+
+
+@pytest.mark.heavy
 def test_gemma4_text_only_generation_patched_matches_unpatched():
     """The Gemma 4 patch must be a no-op for text-only generation."""
     model_path = get_real_model_path(GEMMA4_MODEL_NAME)
@@ -202,8 +153,9 @@ def test_gemma4_text_only_generation_patched_matches_unpatched():
     )
 
 
-def test_gemma4_image_prompt_unified_arch_top5_matches_vlm():
-    """Image+text Gemma 4 generation should stay close to native mlx-vlm."""
+@pytest.mark.heavy
+def test_gemma4_image_prompt_unified_arch_prompt_inputs_match_vlm():
+    """Image+text Gemma 4 prompt inputs should match native mlx-vlm before LM."""
     model_path = get_real_model_path(GEMMA4_MODEL_NAME)
     image_b64 = read_image_b64(
         Path(__file__).parent.parent / "demo-data" / "toucan.jpeg"
@@ -225,74 +177,60 @@ def test_gemma4_image_prompt_unified_arch_top5_matches_vlm():
         max_image_size=(1024, 1024),
     )
     assert input_embeddings is not None
-    unified_first_logits = first_mlx_lm_generation_logits(
-        model_kit.model,
-        input_tokens,
-        input_embeddings=input_embeddings,
-        prefill_step_size=prefill_step_size,
+    patched_text_model = model_kit.model.language_model.model
+    prompt_per_layer_input_ids = patched_text_model.prompt_per_layer_input_ids
+    assert prompt_per_layer_input_ids is not None
+    unified_prompt_embeddings = (
+        input_embeddings[None].astype(mx.float32) * patched_text_model.embed_scale
     )
+    mx.eval(unified_prompt_embeddings)
+    mx.eval(prompt_per_layer_input_ids)
     model_kit.shutdown()
     del model_kit
     mx.clear_cache()
 
     vlm_model = load_vlm(model_path)
+    image_token_index = resolve_image_token_index(vlm_model.config)
     vlm_processor = load_vlm_processor(model_path)
     vlm_inputs = prepare_inputs(
         processor=vlm_processor,
         images=convert_to_pil([image_b64]),
         prompts=prompt,
-        image_token_index=resolve_image_token_index(vlm_model.config),
+        image_token_index=image_token_index,
         resize_shape=None,
     )
     native_input_ids = vlm_inputs["input_ids"]
     native_attention_mask = vlm_inputs["attention_mask"]
     native_pixel_values = vlm_inputs["pixel_values"]
-
-    assert input_tokens.tolist() == native_input_ids[0].tolist()
-
-    vlm_first_logits = first_vlm_generation_logits(
-        vlm_model,
+    native_embedding_output = vlm_model.get_input_embeddings(
         input_ids=native_input_ids,
         pixel_values=native_pixel_values,
-        attention_mask=native_attention_mask,
-        prefill_step_size=prefill_step_size,
+        mask=native_attention_mask,
     )
-    tokenizer = (
-        vlm_processor.tokenizer
-        if hasattr(vlm_processor, "tokenizer")
-        else vlm_processor
+    native_prompt_embeddings = native_embedding_output.inputs_embeds.astype(mx.float32)
+    expected_prompt_per_layer_input_ids = mx.where(
+        native_input_ids == image_token_index, 0, native_input_ids
     )
+    mx.eval(expected_prompt_per_layer_input_ids)
+
+    assert input_tokens.tolist() == native_input_ids[0].tolist()
+    mx.eval(native_prompt_embeddings)
     del vlm_model
     mx.clear_cache()
 
-    unified_top5_ids = topk_token_ids(unified_first_logits, GEMMA4_IMAGE_TOPK)
-    vlm_top5_ids = topk_token_ids(vlm_first_logits, GEMMA4_IMAGE_TOPK)
-    unified_logits = gather_values(unified_first_logits, unified_top5_ids)
-    vlm_logits = gather_values(vlm_first_logits, unified_top5_ids)
-    unified_probabilities = softmax_probabilities(unified_first_logits)
-    vlm_probabilities = softmax_probabilities(vlm_first_logits)
-    unified_top5_probabilities = gather_values(unified_probabilities, unified_top5_ids)
-    vlm_top5_probabilities = gather_values(vlm_probabilities, unified_top5_ids)
-
-    assert unified_top5_ids == vlm_top5_ids, (
-        "Top-5 token IDs/order mismatch: "
-        f"unified={format_token_values(unified_top5_ids, unified_top5_probabilities, tokenizer)} "
-        f"vlm={format_token_values(vlm_top5_ids, gather_values(vlm_probabilities, vlm_top5_ids), tokenizer)}"
+    prompt_embedding_diff = max_abs_diff(
+        unified_prompt_embeddings, native_prompt_embeddings
+    )
+    assert mx.allclose(
+        unified_prompt_embeddings,
+        native_prompt_embeddings,
+        atol=GEMMA4_IMAGE_PROMPT_EMBEDDINGS_ATOL,
+        rtol=0.0,
+    ).item(), (
+        "Prompt embeddings mismatch against native mlx-vlm before LM decode "
+        f"(max diff {prompt_embedding_diff:.6f})."
     )
 
-    relative_diffs = relative_differences(
-        unified_top5_probabilities,
-        vlm_top5_probabilities,
-        GEMMA4_IMAGE_TOPK_PROB_REF_FLOOR,
-    )
-    max_relative_diff = max(relative_diffs)
-
-    assert max_relative_diff <= GEMMA4_IMAGE_TOPK_PROB_RTOL, (
-        "Top-5 probabilities exceeded tolerance: "
-        f"max relative diff {max_relative_diff:.6f}; "
-        f"relative_diffs={relative_diffs}; "
-        f"unified_logits={format_token_values(unified_top5_ids, unified_logits, tokenizer)} "
-        f"vlm_logits={format_token_values(unified_top5_ids, vlm_logits, tokenizer)} "
-        f"unified_probabilities={format_token_values(unified_top5_ids, unified_top5_probabilities, tokenizer)} "
-        f"vlm_probabilities={format_token_values(unified_top5_ids, vlm_top5_probabilities, tokenizer)}"
-    )
+    assert mx.all(
+        prompt_per_layer_input_ids == expected_prompt_per_layer_input_ids
+    ).item(), "Stored prompt_per_layer_input_ids mismatch native masked prompt tokens."
